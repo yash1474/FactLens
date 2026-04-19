@@ -1,6 +1,26 @@
+# Virtual environments
 venv/
+env/
+.venv/
+
+# Environment variables
 .env
+
+# Python cache
 __pycache__/
+*.pyc
+
+# Logs
 *.log
+
+# OS files
 .DS_Store
+
+# VS Code
 .vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+data/
+*.csv

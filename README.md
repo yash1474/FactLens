@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # FactLens - AI Fake News Detector
 
 [![Render Deploy](https://render.com/images/deploy-to-render.svg)](https://render.com/deploy?repo=https://github.com/YOUR_USERNAME/FactLens)
@@ -32,3 +33,6 @@ Visit http://127.0.0.1:5000
 
 Built with Flask, scikit-learn. Model trained on fact-checking datasets.
 
+=======
+# FactLens
+>>>>>>> 19d170517a5d18887a7612895bcd259865e5794e
