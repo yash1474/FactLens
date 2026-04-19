@@ -1,0 +1,13 @@
+venv/
+.env
+__pycache__/
+*.pkl
+*.log
+data/*.csv
+.DS_Store
+run_app.bat
+notepad.env.txt
+~\$*
+flask.*
+TODO.md
+

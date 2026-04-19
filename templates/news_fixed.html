@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Latest News - FactLens</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <main>
+    <nav class="topbar" style="padding: 1rem 0;">
+      <div class="container">
+        <a class="brand" href="/">
+          <span class="brand-mark">F</span>
+          <span>FactLens</span>
+        </a>
+        <a href="/" class="secondary-action">← Back to Home</a>
+      </div>
+    </nav>
+
+    <section class="latest-section" style="padding: 2rem 0 4rem;">
+      <div class="container">
+        <div class="latest-header">
+          <div>
+            <p class="eyebrow dark">Live Feed</p>
+            <h2 id="newsPageTitle">Latest World News</h2>
+            <p id="newsPageDesc">Fresh English-language articles from NewsAPI + Google RSS.</p>
+          </div>
+        </div>
+        <div class="action-row" style="margin-bottom: 1.5rem; justify-content: center;">
+          <input id="newsSearch" type="text" class="news-input" placeholder="Search news..." style="max-width: 400px;">
+          <button id="newsSearchBtn" class="primary-action">Search</button>
+        </div>
+        <div id="newsPageError" class="alert-banner d-none"></div>
+        <div id="newsPageLoading" class="loading-row">
+          <div class="spinner-border spinner-border-sm" aria-hidden="true"></div>
+          <span>Loading headlines...</span>
+        </div>
+        <div id="newsPageGrid" class="news-grid"></div>
+        <div id="newsPagePagination" style="text-align: center; margin-top: 2rem;"></div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const fallbackImage = 'https://images.unsplash.com/photo-1504711434969-e33886168f5c?auto=format&fit=crop&w=900&q=80';
+    let currentPage = 1;
+    const pageSize = 20;
+
+    const newsPageGrid = document.getElementById("newsPageGrid");
+    const newsPageError = document.getElementById("newsPageError");
+    const newsPageLoading = document.getElementById("newsPageLoading");
+    const newsPagePagination = document.getElementById("newsPagePagination");
+    const newsSearch = document.getElementById("newsSearch");
+    const newsSearchBtn = document.getElementById("newsSearchBtn");
+    const newsPageTitle = document.getElementById("newsPageTitle");
+    const newsPageDesc = document.getElementById("newsPageDesc");
+
+    function escapeHTML(value) {
+      return String(value || "").replace(/[&<>"']/g, (char) => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+      })[char]);
+    }
+
+    function relativeTime(value) {
+      if (!value) return "";
+      const published = new Date(value);
+      if (isNaN(published.getTime())) return "";
+      const seconds = Math.floor((Date.now() - published.getTime()) / 1000);
+      const units = [
+        ['day', 86400],
+        ['hour', 3600],
+        ['min', 60]
+      ];
+      for (const [unit, size] of units) {
+        const amount = Math.floor(seconds / size);
+        if (amount >= 1) return `${amount} ${unit}${amount > 1 ? 's' : ''} ago`;
+      }
+      return 'just now';
+    }
+
+    function renderArticles(articles) {
+      newsPageGrid.innerHTML = "";
+      if (!articles.length) {
+        newsPageGrid.innerHTML = `<div class="empty-state" style="grid-column: 1 / -1;">No news found. Try a different search.</div>`;
+        return;
+      }
+      articles.forEach(article => {
+        const card = document.createElement("article");
+        card.className = "news-card";
+        card.innerHTML = `
+          <img src="${escapeHTML(article.image || fallbackImage)}" alt="" class="news-image" loading="lazy" onerror="this.src='${fallbackImage}'">
+          <div class="news-body">
+            <p class="source">${escapeHTML(article.source)}${relativeTime(article.publishedAt) ? `<span>${relativeTime(article.publishedAt)}</span>` : ''}</p>
+            <h3>${escapeHTML(article.title)}</h3>
+            <p class="provider-tag">${escapeHTML(article.provider)}</p>
+            <div class="news-actions">
+              <a class="open-link" href="${escapeHTML(article.url)}" target="_blank" rel="noopener">Open</a>
+            </div>
+          </div>`;
+        newsPageGrid.appendChild(card);
+      });
+    }
+
+    async function loadNewsPage(page = 1, q = '') {
+      newsPageError.classList.add("d-none");
+      newsPageLoading.classList.remove("d-none");
+      newsPageGrid.innerHTML = "";
+      try {
+        const params = new URLSearchParams({ pageSize: pageSize, page: page });
+        if (q) params.append('q', q);
+        const response = await fetch(`/news?${params}`);
+        const data = await response.json();
+        renderArticles(data.articles || []);
+        updatePagination(data.total || data.articles.length, page, q);
+        newsPageTitle.textContent = q ? `Search: ${q}` : 'Latest World News';
+        newsPageDesc.textContent = q ? `Results for "${q}"` : 'Fresh English-language articles.';
+      } catch (error) {
+        newsPageError.textContent = error.message || 'Failed to load news.';
+        newsPageError.classList.remove("d-none");
+      } finally {
+        newsPageLoading.classList.add("d-none");
+      }
+    }
+
+    function updatePagination(total, page, q) {
+      const totalPages = Math.ceil(total / pageSize);
+      newsPagePagination.innerHTML = '';
+      if (totalPages > 1) {
+        const prev = document.createElement('button');
+        prev.className = 'secondary-action';
+        prev.textContent = '← Prev';
+        prev.disabled = page <= 1;
+        prev.onclick = () => loadNewsPage(page - 1, q);
+        newsPagePagination.appendChild(prev);
+        newsPagePagination.append(` Page ${page} of ${totalPages} `);
+        const next = document.createElement('button');
+        next.className = 'primary-action';
+        next.textContent = 'Next →';
+        next.disabled = page >= totalPages;
+        next.onclick = () => loadNewsPage(page + 1, q);
+        newsPagePagination.appendChild(next);
+      }
+    }
+
+    newsSearchBtn.onclick = () => loadNewsPage(1, newsSearch.value);
+    newsSearch.onkeypress = (e) => { if (e.key === 'Enter') newsSearchBtn.click(); };
+
+    // Load initial
+    const urlParams = new URLSearchParams(window.location.search);
+    loadNewsPage(parseInt(urlParams.get('page')) || 1, urlParams.get('q') || '');
+  </script>
+</body>
+</html>
+
