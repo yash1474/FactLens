@@ -21,6 +21,7 @@ from model import MODEL_PATH, TFIDF_PATH, clean_text
 
 
 BASE_DIR = Path(__file__).resolve().parent
+BERT_OUTPUT_DIR = BASE_DIR / "models" / "train_bert"
 
 
 def load_local_env() -> None:
@@ -111,6 +112,9 @@ TRUSTED_SOURCES = {
 
 _model = None
 _tfidf = None
+_bert_model = None
+_bert_tokenizer = None
+_bert_device = None
 _news_cache: dict[str, dict[str, Any]] = {}
 
 
@@ -120,6 +124,62 @@ def load_artifacts() -> None:
         raise FileNotFoundError("model.pkl and tfidf.pkl are missing. Run: python model.py")
     _model = joblib.load(MODEL_PATH)
     _tfidf = joblib.load(TFIDF_PATH)
+
+
+def load_bert_artifacts() -> bool:
+    global _bert_model, _bert_tokenizer, _bert_device
+    if _bert_model is not None and _bert_tokenizer is not None:
+        return True
+    if not BERT_OUTPUT_DIR.exists():
+        return False
+    try:
+        import torch
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+        _bert_tokenizer = AutoTokenizer.from_pretrained(BERT_OUTPUT_DIR, use_fast=False)
+        _bert_model = AutoModelForSequenceClassification.from_pretrained(BERT_OUTPUT_DIR)
+        _bert_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        _bert_model.to(_bert_device)
+        _bert_model.eval()
+        return True
+    except Exception as exc:
+        app.logger.warning(f"BERT artifacts could not be loaded: {exc}")
+        _bert_model = None
+        _bert_tokenizer = None
+        _bert_device = None
+        return False
+
+
+def predict_with_bert(cleaned_text: str) -> dict[str, Any] | None:
+    if not load_bert_artifacts():
+        return None
+    try:
+        import torch
+
+        encoded = _bert_tokenizer(
+            cleaned_text,
+            truncation=True,
+            padding=True,
+            max_length=160,
+            return_tensors="pt",
+        )
+        encoded = {key: value.to(_bert_device) for key, value in encoded.items()}
+        with torch.no_grad():
+            probabilities = torch.softmax(_bert_model(**encoded).logits, dim=1).squeeze(0).cpu().numpy()
+        probability_index = int(probabilities.argmax())
+        confidence_percent = round(float(probabilities[probability_index]) * 100, 2)
+        return {
+            "prediction": "Real" if probability_index == 1 else "Fake",
+            "confidence": confidence_percent,
+            "label": probability_index,
+            "probabilities": {
+                "fake": round(float(probabilities[0]) * 100, 2),
+                "real": round(float(probabilities[1]) * 100, 2),
+            },
+        }
+    except Exception as exc:
+        app.logger.warning(f"BERT prediction failed: {exc}")
+        return None
 
 
 @lru_cache(maxsize=512)
@@ -136,6 +196,16 @@ def predict_article(raw_text: str) -> dict[str, Any]:
     confidence = float(probabilities[probability_index])
     confidence_percent = round(confidence * 100, 2)
     model_prediction = "Real" if predicted_label == 1 else "Fake"
+    bert_result = predict_with_bert(cleaned)
+
+    if bert_result is not None:
+        classical_real_probability = float(probabilities[list(_model.classes_).index(1)])
+        bert_real_probability = float(bert_result["probabilities"]["real"]) / 100
+        blended_real_probability = (classical_real_probability * 0.65) + (bert_real_probability * 0.35)
+        predicted_label = 1 if blended_real_probability >= 0.5 else 0
+        confidence = blended_real_probability if predicted_label == 1 else 1 - blended_real_probability
+        confidence_percent = round(confidence * 100, 2)
+        model_prediction = "Real" if predicted_label == 1 else "Fake"
 
     return {
         "prediction": model_prediction,
@@ -143,6 +213,7 @@ def predict_article(raw_text: str) -> dict[str, Any]:
         "confidence": confidence_percent,
         "label": predicted_label,
         "modelPrediction": model_prediction,
+        "bertPrediction": bert_result,
         "wordCount": word_count,
     }
 
