@@ -12,6 +12,7 @@ the main fake/real score.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import string
@@ -44,6 +45,7 @@ _hub_override = (os.environ.get("FACTLENS_BERT_HUB_ID") or "").strip()
 BERT_MODEL_NAME = _hub_override or _DEFAULT_BERT_HUB_ID
 BERT_DISPLAY_NAME = "BERT Model"
 BERT_MAX_LENGTH = 256
+BERT_FALLBACK_DIMENSION = 128
 
 _encoder_cache: dict[str, tuple[object, object, "torch.device"]] = {}
 
@@ -69,7 +71,10 @@ def get_bert_encoder(
     import torch
     from transformers import AutoModel, AutoTokenizer
 
-    local_files_only = os.environ.get("FACTLENS_BERT_LOCAL_ONLY", "").strip().lower() in {"1", "true", "yes"}
+    local_files_only = (
+        os.environ.get("FACTLENS_BERT_LOCAL_ONLY", "").strip().lower() in {"1", "true", "yes"}
+        or os.environ.get("RENDER", "").strip().lower() in {"1", "true", "yes"}
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, local_files_only=local_files_only)
@@ -89,6 +94,24 @@ def get_bert_encoder(
     return _encoder_cache[model_name]
 
 
+def fallback_embeddings(texts: list[str], dimension: int = BERT_FALLBACK_DIMENSION) -> np.ndarray:
+    """Return deterministic local embeddings when hosted BERT files are unavailable."""
+    rows = np.zeros((len(texts), dimension), dtype=np.float32)
+    for row_index, text in enumerate(texts):
+        tokens = re.findall(r"[a-z0-9]+", clean_text(text))
+        if not tokens:
+            continue
+        for token in tokens:
+            digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+            bucket = int.from_bytes(digest[:4], "little") % dimension
+            sign = 1.0 if digest[4] % 2 == 0 else -1.0
+            rows[row_index, bucket] += sign
+        norm = np.linalg.norm(rows[row_index])
+        if norm > 0:
+            rows[row_index] /= norm
+    return rows
+
+
 def mean_pool_embeddings(
     texts: list[str],
     *,
@@ -99,7 +122,19 @@ def mean_pool_embeddings(
     """Return float32 matrix (n, hidden) using masked mean pooling over last hidden states."""
     import torch
 
-    model, tokenizer, device = get_bert_encoder(model_name=model_name)
+    try:
+        model, tokenizer, device = get_bert_encoder(model_name=model_name)
+    except Exception as exc:
+        allow_fallback = os.environ.get("FACTLENS_DISABLE_EMBEDDING_FALLBACK", "").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+        }
+        if not allow_fallback:
+            raise
+        print(f"WARNING: BERT encoder unavailable; using local fallback embeddings. Reason: {exc}")
+        return fallback_embeddings(texts)
+
     rows: list[np.ndarray] = []
     with torch.no_grad():
         for start in range(0, len(texts), batch_size):

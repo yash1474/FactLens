@@ -16,6 +16,7 @@ import joblib
 import requests
 from flask import Flask, jsonify, render_template, request
 from sklearn.metrics.pairwise import cosine_similarity
+from werkzeug.exceptions import HTTPException
 
 from model import BERT_DISPLAY_NAME, MODEL_PATH, TFIDF_PATH, clean_text, mean_pool_embeddings
 
@@ -164,6 +165,25 @@ def load_artifacts() -> None:
         raise FileNotFoundError("model.pkl and tfidf.pkl are missing. Run: python model.py")
     _model = joblib.load(MODEL_PATH)
     _tfidf = joblib.load(TFIDF_PATH)
+
+
+def wants_json_response() -> bool:
+    return request.path in {"/predict", "/news", "/topic", "/healthz"} or request.path.startswith("/api/")
+
+
+@app.errorhandler(HTTPException)
+def handle_http_error(exc: HTTPException):
+    if not wants_json_response():
+        return exc
+    return jsonify({"error": exc.description or exc.name, "status": exc.code}), exc.code or 500
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(exc: Exception):
+    app.logger.exception("Unhandled request error")
+    if not wants_json_response():
+        return render_template("index.html"), 500
+    return jsonify({"error": "Server error. Check Render logs for details.", "status": 500}), 500
 
 
 def _probability_payload(estimator: Any, features: Any) -> dict[str, Any]:
@@ -629,6 +649,20 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/healthz")
+def healthz():
+    return jsonify(
+        {
+            "ok": Path(MODEL_PATH).exists() and Path(TFIDF_PATH).exists(),
+            "modelArtifact": Path(MODEL_PATH).exists(),
+            "tfidfArtifact": Path(TFIDF_PATH).exists(),
+            "newsApiConfigured": bool(os.getenv("NEWS_API_KEY")),
+            "bertLocalOnly": os.getenv("FACTLENS_BERT_LOCAL_ONLY", ""),
+            "render": os.getenv("RENDER", ""),
+        }
+    )
+
+
 @app.route("/predict", methods=["POST"])
 def predict():
     data = request.get_json(silent=True) or request.form
@@ -655,9 +689,13 @@ def latest_news():
         page_size = int(request.args.get("pageSize", "9"))
     except ValueError:
         page_size = 9
-    articles, error = fetch_latest_news(query=query, page_size=page_size)
-    status = 503 if error and not articles else 200
-    return jsonify({"articles": articles, "error": error, "query": query or NEWS_DEFAULT_QUERY}), status
+    try:
+        articles, error = fetch_latest_news(query=query, page_size=page_size)
+        status = 503 if error and not articles else 200
+        return jsonify({"articles": articles, "error": error, "query": query or NEWS_DEFAULT_QUERY}), status
+    except Exception:
+        app.logger.exception("News fetch failed")
+        return jsonify({"articles": [], "error": "Latest news could not be loaded right now.", "query": query or NEWS_DEFAULT_QUERY}), 503
 
 
 @app.route("/news_page")
