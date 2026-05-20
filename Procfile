@@ -1,1 +1,1 @@
-web: FACTLENS_BERT_LOCAL_ONLY=1 gunicorn --timeout 120 app:app
+web: FACTLENS_USE_BERT=0 gunicorn --workers 1 --timeout 120 app:app

@@ -18,7 +18,15 @@ from flask import Flask, jsonify, render_template, request
 from sklearn.metrics.pairwise import cosine_similarity
 from werkzeug.exceptions import HTTPException
 
-from model import BERT_DISPLAY_NAME, MODEL_PATH, TFIDF_PATH, clean_text, mean_pool_embeddings
+from model import (
+    BERT_DISPLAY_NAME,
+    FALLBACK_DISPLAY_NAME,
+    MODEL_PATH,
+    TFIDF_PATH,
+    clean_text,
+    mean_pool_embeddings,
+    should_use_bert_runtime,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -225,7 +233,7 @@ def classifier_breakdown(features: Any, bert_result: dict[str, Any]) -> list[dic
     breakdown.append(
         {
             "id": "bert_model",
-            "name": "BERT Model",
+            "name": BERT_DISPLAY_NAME if should_use_bert_runtime() else FALLBACK_DISPLAY_NAME,
             "prediction": bert_result["prediction"],
             "confidence": bert_result["confidence"],
             "probabilities": bert_result["probabilities"],
@@ -282,7 +290,7 @@ def predict_article(raw_text: str) -> dict[str, Any]:
     model_breakdown = classifier_breakdown(features, bert_result)
     voting_summary = build_voting_summary(model_breakdown)
     bert_meta: dict[str, Any] = {
-        "model": "BERT Model",
+        "model": BERT_DISPLAY_NAME if should_use_bert_runtime() else FALLBACK_DISPLAY_NAME,
         "prediction": model_prediction,
         "confidence": confidence_percent,
         "probabilities": bert_result["probabilities"],
@@ -657,6 +665,7 @@ def healthz():
             "modelArtifact": Path(MODEL_PATH).exists(),
             "tfidfArtifact": Path(TFIDF_PATH).exists(),
             "newsApiConfigured": bool(os.getenv("NEWS_API_KEY")),
+            "useBert": os.getenv("FACTLENS_USE_BERT", ""),
             "bertLocalOnly": os.getenv("FACTLENS_BERT_LOCAL_ONLY", ""),
             "render": os.getenv("RENDER", ""),
         }

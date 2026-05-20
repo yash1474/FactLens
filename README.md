@@ -21,9 +21,22 @@ Visit http://127.0.0.1:5000
 ## Deploy to Render
 1. Fork/Clone repo
 2. New Web Service -> Connect GitHub repo
-3. Build: `pip install -r requirements.txt && python scripts/cache_bert.py`
-4. Start: `FACTLENS_BERT_LOCAL_ONLY=1 gunicorn --timeout 120 app:app`
+3. Build: `pip install -r requirements.txt`
+4. Start: `FACTLENS_USE_BERT=0 gunicorn --workers 1 --timeout 120 app:app`
 5. Add NEWS_API_KEY env var
+
+### Render model mode
+Render free/small instances can kill the worker when PyTorch/BERT loads. The
+default Render start command sets `FACTLENS_USE_BERT=0`, so deployment uses a
+lightweight hosted fallback encoder and still returns predictions instead of
+crashing. Local runs still use BERT by default.
+
+To run full BERT on a larger Render instance, set `FACTLENS_USE_BERT=1`, use one
+worker, and cache the model during build:
+
+```bash
+pip install -r requirements.txt && python scripts/cache_bert.py
+```
 
 ## API Endpoints
 - POST /predict - Fact-check text

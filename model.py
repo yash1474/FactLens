@@ -44,6 +44,7 @@ _DEFAULT_BERT_HUB_ID = "prajjwal1/bert-tiny"
 _hub_override = (os.environ.get("FACTLENS_BERT_HUB_ID") or "").strip()
 BERT_MODEL_NAME = _hub_override or _DEFAULT_BERT_HUB_ID
 BERT_DISPLAY_NAME = "BERT Model"
+FALLBACK_DISPLAY_NAME = "Hosted Fallback Model"
 BERT_MAX_LENGTH = 256
 BERT_FALLBACK_DIMENSION = 128
 
@@ -51,6 +52,7 @@ _encoder_cache: dict[str, tuple[object, object, "torch.device"]] = {}
 
 PUNCT_TRANSLATION = str.maketrans("", "", string.punctuation)
 WHITESPACE_RE = re.compile(r"\s+")
+TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
 def clean_text(value: object) -> str:
@@ -59,6 +61,22 @@ def clean_text(value: object) -> str:
     text = text.lower().translate(PUNCT_TRANSLATION)
     text = WHITESPACE_RE.sub(" ", text)
     return text.strip()
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in TRUTHY_ENV_VALUES
+
+
+def should_use_bert_runtime() -> bool:
+    """Keep small Render instances away from Torch unless explicitly enabled."""
+    if os.environ.get("FACTLENS_USE_BERT") is not None:
+        return env_flag("FACTLENS_USE_BERT")
+    if env_flag("RENDER"):
+        return False
+    return True
 
 
 def get_bert_encoder(
@@ -82,8 +100,8 @@ def get_bert_encoder(
     except OSError as exc:
         if local_files_only:
             raise RuntimeError(
-                "BERT files are not cached on the server. On Render, add "
-                "`python scripts/cache_bert.py` to the build command, then redeploy."
+                "BERT files are not available on the server. Render uses the hosted fallback by default; "
+                "set FACTLENS_USE_BERT=1 only on a larger instance."
             ) from exc
         raise
     model.eval()
@@ -120,7 +138,8 @@ def mean_pool_embeddings(
     model_name: str = BERT_MODEL_NAME,
 ) -> np.ndarray:
     """Return float32 matrix (n, hidden) using masked mean pooling over last hidden states."""
-    import torch
+    if not should_use_bert_runtime():
+        return fallback_embeddings(texts)
 
     try:
         model, tokenizer, device = get_bert_encoder(model_name=model_name)
@@ -134,6 +153,8 @@ def mean_pool_embeddings(
             raise
         print(f"WARNING: BERT encoder unavailable; using local fallback embeddings. Reason: {exc}")
         return fallback_embeddings(texts)
+
+    import torch
 
     rows: list[np.ndarray] = []
     with torch.no_grad():
