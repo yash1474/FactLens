@@ -198,13 +198,14 @@
       async function parseResponse(response) {
         const raw = await response.text();
         if (!raw) {
-          throw new Error("The server returned an empty response. Make sure Flask is running without errors.");
+          throw new Error(`The server returned an empty response (${response.status}). Check the deployment logs.`);
         }
 
         try {
           return JSON.parse(raw);
         } catch {
-          throw new Error("The server did not return JSON. Restart Flask from the project virtualenv and try again.");
+          const preview = raw.replace(/\s+/g, " ").slice(0, 140);
+          throw new Error(`The server returned ${response.status} ${response.statusText || ""} instead of JSON. Check the Render logs. ${preview}`);
         }
       }
 

@@ -69,9 +69,18 @@ def get_bert_encoder(
     import torch
     from transformers import AutoModel, AutoTokenizer
 
+    local_files_only = os.environ.get("FACTLENS_BERT_LOCAL_ONLY", "").strip().lower() in {"1", "true", "yes"}
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
-    model = AutoModel.from_pretrained(model_name)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, local_files_only=local_files_only)
+        model = AutoModel.from_pretrained(model_name, local_files_only=local_files_only)
+    except OSError as exc:
+        if local_files_only:
+            raise RuntimeError(
+                "BERT files are not cached on the server. On Render, add "
+                "`python scripts/cache_bert.py` to the build command, then redeploy."
+            ) from exc
+        raise
     model.eval()
     model.to(device)
     for param in model.parameters():

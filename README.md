@@ -21,8 +21,8 @@ Visit http://127.0.0.1:5000
 ## Deploy to Render
 1. Fork/Clone repo
 2. New Web Service -> Connect GitHub repo
-3. Build: `pip install -r requirements.txt`
-4. Start: `gunicorn app:app`
+3. Build: `pip install -r requirements.txt && python scripts/cache_bert.py`
+4. Start: `FACTLENS_BERT_LOCAL_ONLY=1 gunicorn --timeout 120 app:app`
 5. Add NEWS_API_KEY env var
 
 ## API Endpoints
