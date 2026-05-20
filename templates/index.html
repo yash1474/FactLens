@@ -31,7 +31,7 @@
               </p>
               <div class="hero-metrics" aria-label="Model highlights">
                 <div>
-                  <strong>95.76%</strong>
+                  <strong>90.72%</strong>
                   <span>test accuracy</span>
                 </div>
                 <div>
@@ -283,6 +283,7 @@
           supportCount: response.supportCount ?? data.supportCount ?? 0,
           trustedSupportCount: response.trustedSupportCount ?? data.trustedSupportCount ?? 0,
           bestSimilarity: response.bestSimilarity ?? data.bestSimilarity ?? 0,
+          bestExactScore: response.bestExactScore ?? data.bestExactScore ?? 0,
           matchedArticle: matchedArticle
             ? {
                 title: matchedArticle.title,

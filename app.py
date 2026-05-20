@@ -83,7 +83,7 @@ FAKE_CONFIDENCE_THRESHOLD = 95.0
 REAL_CONFIDENCE_THRESHOLD = 60.0
 EVIDENCE_SUPPORT_THRESHOLD = 2
 EVIDENCE_SIMILARITY_THRESHOLD = 0.75
-HIGH_EVIDENCE_SIMILARITY_THRESHOLD = 0.99
+EXACT_MATCH_SCORE_THRESHOLD = 0.9990
 TRUSTED_SOURCES = {
     "ABC News",
     "ABC News (AU)",
@@ -326,49 +326,50 @@ def has_enough_article_text(title: str, description: str) -> bool:
     return len(words) >= MIN_ARTICLE_WORDS and english_ratio >= 0.40
 
 
+def normalize_exact_match_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text.casefold()).strip()
+
+
 def score_supporting_articles(
     raw_text: str,
     articles: list[dict[str, str]],
-    exclude_url: str = "",
 ) -> list[dict[str, Any]]:
     if _tfidf is None:
         load_artifacts()
     if not articles:
         return []
 
-    input_title = clean_text(raw_text.splitlines()[0] if raw_text.splitlines() else raw_text)
     filtered_articles = []
     for article in articles:
-        if exclude_url and article.get("url") == exclude_url:
-            continue
-        if clean_text(article.get("title", "")) == input_title:
-            continue
         filtered_articles.append(article)
     if not filtered_articles:
         return []
 
-    article_texts = [
-        f"{article.get('title', '')} {article.get('description', '')} {article.get('content', '')}"
-        for article in filtered_articles
-    ]
+    article_texts = [f"{article.get('title', '')} {article.get('description', '')}" for article in filtered_articles]
     vectors = _tfidf.transform([clean_text(raw_text), *[clean_text(text) for text in article_texts]])
     tfidf_similarities = cosine_similarity(vectors[0], vectors[1:]).ravel()
 
     raw_title = raw_text.splitlines()[0] if raw_text.splitlines() else raw_text
     clean_raw_title = clean_text(raw_title)
     clean_raw_text = clean_text(raw_text)
+    exact_raw_text = normalize_exact_match_text(raw_text)
 
     scored_articles = []
-    LOW_SIM_THRESHOLD = 20.0
+    LOW_SIM_THRESHOLD = 0.20
     for article, tfidf_score in zip(filtered_articles, tfidf_similarities):
         article_title = clean_text(article.get("title", ""))
+        raw_article_text = f"{article.get('title', '')} {article.get('description', '')}"
         article_text = clean_text(f"{article.get('title', '')} {article.get('description', '')}")
         title_score = SequenceMatcher(None, clean_raw_title, article_title).ratio()
         text_score = SequenceMatcher(None, clean_raw_text, article_text).ratio()
+        exact_score = SequenceMatcher(None, exact_raw_text, normalize_exact_match_text(raw_article_text)).ratio()
         score = max(float(tfidf_score), title_score, text_score)
         item = dict(article)
         item["similarity"] = round(score * 100, 2)
-        if score >= EVIDENCE_SIMILARITY_THRESHOLD:
+        item["exactScore"] = round(exact_score, 4)
+        if exact_score > EXACT_MATCH_SCORE_THRESHOLD:
+            item["matchType"] = "Exact"
+        elif score >= EVIDENCE_SIMILARITY_THRESHOLD:
             item["matchType"] = "Supporting"
         elif score >= LOW_SIM_THRESHOLD:
             item["matchType"] = "Possible"
@@ -377,7 +378,11 @@ def score_supporting_articles(
         scored_articles.append(item)
 
         app.logger.info(f"Showing {len(scored_articles)} related articles with min 20% similarity")
-    return sorted(scored_articles, key=lambda article: article["similarity"], reverse=True)
+    return sorted(
+        scored_articles,
+        key=lambda article: (article.get("matchType") == "Exact", article.get("exactScore", 0), article["similarity"]),
+        reverse=True,
+    )
 
 
 def build_verdict(raw_text: str, source: str = "", url: str = "") -> dict[str, Any]:
@@ -391,12 +396,13 @@ def build_verdict(raw_text: str, source: str = "", url: str = "") -> dict[str, A
         app.logger.debug(f"Evidence query: {evidence_query}")
         candidate_articles, evidence_error = fetch_evidence_candidates(query=evidence_query, page_size=12)
         app.logger.debug(f"Candidate articles: {len(candidate_articles)}, error: {evidence_error}")
-        supporting_articles = score_supporting_articles(raw_text, candidate_articles, exclude_url=url)
+        supporting_articles = score_supporting_articles(raw_text, candidate_articles)
 
     trusted_support_count = sum(1 for article in supporting_articles if is_trusted_source(article.get("source")))
     support_count = len(supporting_articles)
     best_similarity = max((float(article.get("similarity", 0)) for article in supporting_articles), default=0.0)
-    exact_match = best_similarity >= 100.0
+    best_exact_score = max((float(article.get("exactScore", 0)) for article in supporting_articles), default=0.0)
+    exact_match = best_exact_score > EXACT_MATCH_SCORE_THRESHOLD
 
     prediction = model_result["modelPrediction"]
     confidence = float(model_result["modelConfidence"])
@@ -443,6 +449,7 @@ def build_verdict(raw_text: str, source: str = "", url: str = "") -> dict[str, A
             "supportCount": support_count,
             "trustedSupportCount": trusted_support_count,
             "bestSimilarity": round(best_similarity, 2),
+            "bestExactScore": round(best_exact_score, 4),
             "matchedArticle": supporting_articles[0] if exact_match and supporting_articles else None,
             "error": evidence_error,
         },
@@ -451,6 +458,7 @@ def build_verdict(raw_text: str, source: str = "", url: str = "") -> dict[str, A
         "supportCount": support_count,
         "trustedSupportCount": trusted_support_count,
         "bestSimilarity": round(best_similarity, 2),
+        "bestExactScore": round(best_exact_score, 4),
         "source": source,
         "url": url,
         "supportingArticles": supporting_articles[:3],
