@@ -1,10 +1,3 @@
-"""Time-capped BERT fine-tuning for FactLens (``train_bert``).
-
-Keeps the existing TF-IDF + Logistic/Passive-Aggressive artifacts intact and
-writes a separate optional BERT model under ``models/train_bert``. Defaults
-cap wall-clock training at 10 minutes and use a balanced subset for a quick
-CPU-friendly run.
-"""
 
 from __future__ import annotations
 
@@ -21,10 +14,9 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-from model import BASE_DIR, load_datasets
+from model import BASE_DIR, BERT_DISPLAY_NAME, BERT_MODEL_NAME, load_datasets
 
 
-BERT_MODEL_NAME = "prajjwal1/bert-tiny"
 BERT_OUTPUT_DIR = BASE_DIR / "models" / "train_bert"
 
 
@@ -100,7 +92,12 @@ def fine_tune_bert(
     random_state: int = 42,
 ) -> None:
     set_seed(random_state)
+    print(
+        "Loading datasets (True/Fake/WELFake CSVs are large; this can take several minutes on OneDrive or HDD)...",
+        flush=True,
+    )
     df = balanced_sample(load_datasets(), max_examples=max_examples, random_state=random_state)
+    print(f"Using {len(df)} balanced examples for BERT.", flush=True)
     train_df, test_df = train_test_split(
         df,
         test_size=0.2,
@@ -108,6 +105,7 @@ def fine_tune_bert(
         stratify=df["label"],
     )
 
+    print(f"Loading tokenizer and {BERT_DISPLAY_NAME} from Hugging Face...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
     model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
 
@@ -147,7 +145,7 @@ def fine_tune_bert(
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     metadata = {
-        "base_model": model_name,
+        "base_model": BERT_DISPLAY_NAME,
         "labels": {"0": "Fake", "1": "Real"},
         "max_examples": int(max_examples),
         "train_examples": int(len(train_df)),

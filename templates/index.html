@@ -55,6 +55,12 @@
               <div class="confidence-track" aria-hidden="true">
                 <div id="confidenceBar" class="confidence-bar" style="width: 0%"></div>
               </div>
+              <div id="decisionReason" class="decision-reason d-none"></div>
+              <div id="modelBreakdown" class="model-breakdown d-none"></div>
+              <details id="apiDetails" class="api-details d-none">
+                <summary>News API / RSS response</summary>
+                <pre id="apiPreview"></pre>
+              </details>
             </div>
           </div>
         </div>
@@ -89,17 +95,17 @@
 
             <aside class="insight-panel" aria-label="Model details">
               <div class="insight-item">
-                <span class="insight-icon">OK</span>
+                <span class="insight-icon">B</span>
                 <div>
-                  <strong>Fast inference</strong>
-                  <p>TF-IDF vectors and Logistic Regression keep latency low.</p>
+                  <strong>BERT Model</strong>
+                  <p>Shows the model prediction with confidence and probability scores.</p>
                 </div>
               </div>
               <div class="insight-item">
-                <span class="insight-icon">#</span>
+                <span class="insight-icon">%</span>
                 <div>
-                  <strong>Bigram context</strong>
-                  <p>Uses unigrams and bigrams with a 5,000 feature vocabulary.</p>
+                  <strong>Probability score</strong>
+                  <p>Displays Fake and Real probabilities for the checked news text.</p>
                 </div>
               </div>
               <div class="insight-item">
@@ -165,6 +171,10 @@
       const resultBadge = document.getElementById("resultBadge");
       const confidenceText = document.getElementById("confidenceText");
       const confidenceBar = document.getElementById("confidenceBar");
+      const decisionReason = document.getElementById("decisionReason");
+      const modelBreakdown = document.getElementById("modelBreakdown");
+      const apiDetails = document.getElementById("apiDetails");
+      const apiPreview = document.getElementById("apiPreview");
       const newsGrid = document.getElementById("newsGrid");
       const newsError = document.getElementById("newsError");
       const newsLoading = document.getElementById("newsLoading");
@@ -209,14 +219,81 @@
       }
 
       function updateResult(data) {
-        const isFake = data.prediction === "Likely Fake";
+        const isFake = String(data.prediction || "").includes("Fake");
+        const isReal = String(data.prediction || "").includes("Real");
+        const needsReview = String(data.prediction || "").includes("Review");
         resultPanel.classList.toggle("fake", isFake);
-        resultPanel.classList.toggle("real", data.prediction === "Likely Real");
-        resultPanel.classList.remove("review");
+        resultPanel.classList.toggle("real", isReal);
+        resultPanel.classList.toggle("review", needsReview);
         resultText.textContent = data.prediction;
         resultBadge.textContent = data.verdict || (isFake ? "Check evidence" : "Evidence check");
-        confidenceText.textContent = `${data.confidence}% ML confidence | ${data.reason || "Evidence-assisted model verdict"}`;
+        confidenceText.textContent = `${data.confidence}% average confidence`;
         confidenceBar.style.width = `${Math.min(100, Math.max(0, data.confidence))}%`;
+        decisionReason.classList.remove("d-none");
+        decisionReason.textContent = data.votingSummary?.explanation || data.reason || "Final prediction uses majority voting.";
+        renderModelBreakdown(data);
+        renderApiPreview(data);
+      }
+
+      function renderModelBreakdown(data) {
+        const rows = data.modelBreakdown || [];
+        modelBreakdown.innerHTML = "";
+        if (!rows.length) {
+          modelBreakdown.classList.add("d-none");
+          return;
+        }
+        modelBreakdown.classList.remove("d-none");
+        rows.forEach((row) => {
+          const predictionClass = String(row.prediction || "").toLowerCase();
+          const probabilities = row.probabilities
+            ? `<span>Fake ${escapeHTML(row.probabilities.fake)}%</span><span>Real ${escapeHTML(row.probabilities.real)}%</span>`
+            : "";
+          const item = document.createElement("div");
+          item.className = "model-vote";
+          item.innerHTML = `
+            <div>
+              <strong>${escapeHTML(row.name)}</strong>
+            </div>
+            <div class="vote-result ${predictionClass}">
+              <b>${escapeHTML(row.prediction)}</b>
+              <span>${escapeHTML(row.confidence)}%</span>
+            </div>
+            <div class="vote-probs">${probabilities}</div>
+          `;
+          modelBreakdown.appendChild(item);
+        });
+      }
+
+      function renderApiPreview(data) {
+        apiDetails.classList.remove("d-none");
+        const response = data.evidenceApiResponse || {};
+        const matchedArticle = response.matchedArticle;
+        const apiShape = {
+          response: response.status || "Exact news article not found",
+          exactArticleFound: Boolean(response.exactArticleFound),
+          lookup: response.lookup || "NewsAPI + Google News RSS",
+          query: response.query || data.evidenceQuery || "",
+          voting: data.votingSummary
+            ? {
+                finalPrediction: data.votingSummary.prediction,
+                averageConfidence: data.votingSummary.averageConfidence,
+                votes: data.votingSummary.votes
+              }
+            : null,
+          supportCount: response.supportCount ?? data.supportCount ?? 0,
+          trustedSupportCount: response.trustedSupportCount ?? data.trustedSupportCount ?? 0,
+          bestSimilarity: response.bestSimilarity ?? data.bestSimilarity ?? 0,
+          matchedArticle: matchedArticle
+            ? {
+                title: matchedArticle.title,
+                source: matchedArticle.source,
+                provider: matchedArticle.provider,
+                url: matchedArticle.url
+              }
+            : null,
+          error: response.error || data.evidenceError || null
+        };
+        apiPreview.textContent = JSON.stringify(apiShape, null, 2);
       }
 
       function relativeTime(value) {
@@ -283,6 +360,12 @@
         resultBadge.textContent = "Waiting";
         confidenceText.textContent = "Enter news text to see the model confidence.";
         confidenceBar.style.width = "0%";
+        decisionReason.classList.add("d-none");
+        decisionReason.textContent = "";
+        modelBreakdown.classList.add("d-none");
+        modelBreakdown.innerHTML = "";
+        apiDetails.classList.add("d-none");
+        apiPreview.textContent = "";
         relatedPanel.classList.add("d-none");
         relatedGrid.innerHTML = "";
       });
@@ -331,7 +414,10 @@
             newsText.value = `${article.title}\n\n${article.description || article.content || ""}`.trim();
             try {
               const result = await predictText(newsText.value, button, article.source || "", article.url || "");
-              articleResult.textContent = `${result.prediction} | ${result.confidence}% confidence`;
+              const probabilities = result.probabilities
+                ? ` | Fake ${result.probabilities.fake}% | Real ${result.probabilities.real}%`
+                : "";
+              articleResult.textContent = `${result.prediction} | ${result.confidence}% average confidence${probabilities}`;
               articleResult.className = `article-result ${result.prediction.toLowerCase().replace(/\s+/g, "-")}`;
             } catch {
               articleResult.textContent = "Unable to check this headline.";

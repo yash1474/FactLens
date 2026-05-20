@@ -1,33 +1,51 @@
-"""Training pipeline for the FactLens fake news detector.
+﻿"""Training pipeline for the FactLens fake news detector.
 
 Run this file whenever you need to rebuild ``model.pkl`` and ``tfidf.pkl``.
-The model intentionally uses TF-IDF + Logistic Regression for fast CPU-only
-training and low-latency inference.
+
+The classifier is a soft-voting ensemble of **Logistic Regression** and
+**calibrated PassiveAggressive**, trained on **mean-pooled BERT**
+embeddings. ``tfidf.pkl`` is still
+trained for **related-article / evidence similarity** in the Flask app, not for
+the main fake/real score.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import string
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import VotingClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.linear_model import PassiveAggressiveClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression, PassiveAggressiveClassifier
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
+
+if TYPE_CHECKING:
+    import torch
 
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 MODEL_PATH = BASE_DIR / "model.pkl"
 TFIDF_PATH = BASE_DIR / "tfidf.pkl"
+
+# BERT model id used internally by the encoder.
+# Override with env ``FACTLENS_BERT_HUB_ID`` for a different BERT model.
+_DEFAULT_BERT_HUB_ID = "prajjwal1/bert-tiny"
+_hub_override = (os.environ.get("FACTLENS_BERT_HUB_ID") or "").strip()
+BERT_MODEL_NAME = _hub_override or _DEFAULT_BERT_HUB_ID
+BERT_DISPLAY_NAME = "BERT Model"
+BERT_MAX_LENGTH = 256
+
+_encoder_cache: dict[str, tuple[object, object, "torch.device"]] = {}
 
 PUNCT_TRANSLATION = str.maketrans("", "", string.punctuation)
 WHITESPACE_RE = re.compile(r"\s+")
@@ -39,6 +57,62 @@ def clean_text(value: object) -> str:
     text = text.lower().translate(PUNCT_TRANSLATION)
     text = WHITESPACE_RE.sub(" ", text)
     return text.strip()
+
+
+def get_bert_encoder(
+    model_name: str = BERT_MODEL_NAME,
+) -> tuple[object, object, "torch.device"]:
+    """Load BERT once per ``model_name`` for text encoding."""
+    if model_name in _encoder_cache:
+        return _encoder_cache[model_name]
+
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+    model = AutoModel.from_pretrained(model_name)
+    model.eval()
+    model.to(device)
+    for param in model.parameters():
+        param.requires_grad = False
+    _encoder_cache[model_name] = (model, tokenizer, device)
+    return _encoder_cache[model_name]
+
+
+def mean_pool_embeddings(
+    texts: list[str],
+    *,
+    batch_size: int = 16,
+    max_length: int = BERT_MAX_LENGTH,
+    model_name: str = BERT_MODEL_NAME,
+) -> np.ndarray:
+    """Return float32 matrix (n, hidden) using masked mean pooling over last hidden states."""
+    import torch
+
+    model, tokenizer, device = get_bert_encoder(model_name=model_name)
+    rows: list[np.ndarray] = []
+    with torch.no_grad():
+        for start in range(0, len(texts), batch_size):
+            batch = texts[start : start + batch_size]
+            encoded = tokenizer(
+                batch,
+                truncation=True,
+                padding=True,
+                max_length=max_length,
+                return_tensors="pt",
+            )
+            encoded = {key: value.to(device) for key, value in encoded.items()}
+            outputs = model(**encoded)
+            hidden = outputs.last_hidden_state
+            mask = encoded["attention_mask"].unsqueeze(-1).expand(hidden.size()).float()
+            summed = (hidden * mask).sum(dim=1)
+            denom = mask.sum(dim=1).clamp(min=1e-9)
+            pooled = (summed / denom).cpu().numpy().astype(np.float32)
+            rows.append(pooled)
+    if not rows:
+        return np.zeros((0, 0), dtype=np.float32)
+    return np.vstack(rows)
 
 
 def _standardize_frame(df: pd.DataFrame, label: int | None = None) -> pd.DataFrame:
@@ -86,7 +160,27 @@ def load_datasets(data_dir: Path = DATA_DIR) -> pd.DataFrame:
     return training_frame[["content", "label"]]
 
 
-def train_model(test_size: float = 0.2, random_state: int = 42) -> tuple[VotingClassifier, TfidfVectorizer]:
+def _stratified_subsample(frame: pd.DataFrame, n: int, random_state: int) -> pd.DataFrame:
+    """Return at most ``n`` rows with class balance; uses sklearn (pandas ``sample`` may lack ``stratify``)."""
+    if len(frame) <= n:
+        return frame.reset_index(drop=True)
+    sampled, _ = train_test_split(
+        frame,
+        train_size=n,
+        stratify=frame["label"],
+        random_state=random_state,
+    )
+    return sampled.reset_index(drop=True)
+
+
+def train_model(
+    test_size: float = 0.2,
+    random_state: int = 42,
+    max_bert_train: int = 12000,
+    max_bert_eval: int | None = 8000,
+    bert_batch_size: int = 16,
+    bert_model_name: str = BERT_MODEL_NAME,
+) -> tuple[VotingClassifier, TfidfVectorizer]:
     df = load_datasets()
     print(f"Loaded {len(df):,} usable articles")
     print(df["label"].value_counts().rename(index={1: "REAL", 0: "FAKE"}).to_string())
@@ -107,8 +201,23 @@ def train_model(test_size: float = 0.2, random_state: int = 42) -> tuple[VotingC
         min_df=2,
         dtype=np.float32,
     )
-    x_train_tfidf = tfidf.fit_transform(x_train)
-    x_test_tfidf = tfidf.transform(x_test)
+    tfidf.fit(x_train)
+
+    train_frame = pd.DataFrame({"content": x_train.tolist(), "label": y_train.tolist()})
+    if len(train_frame) > max_bert_train:
+        train_frame = _stratified_subsample(train_frame, max_bert_train, random_state)
+
+    print(
+        f"\nEncoding {len(train_frame):,} training texts with '{BERT_DISPLAY_NAME}' "
+        f"(batch_size={bert_batch_size})...",
+        flush=True,
+    )
+    x_train_emb = mean_pool_embeddings(
+        train_frame["content"].tolist(),
+        batch_size=bert_batch_size,
+        model_name=bert_model_name,
+    )
+    y_train_emb = train_frame["label"].astype(int).to_numpy()
 
     logistic_model = LogisticRegression(max_iter=1000, solver="liblinear", random_state=random_state)
     passive_aggressive = CalibratedClassifierCV(
@@ -124,19 +233,31 @@ def train_model(test_size: float = 0.2, random_state: int = 42) -> tuple[VotingC
         voting="soft",
         weights=[1.0, 1.15],
     )
-    model.fit(x_train_tfidf, y_train)
+    model.fit(x_train_emb, y_train_emb)
 
-    predictions = model.predict(x_test_tfidf)
-    print(f"\nAccuracy: {accuracy_score(y_test, predictions):.4f}")
+    eval_frame = pd.DataFrame({"content": x_test.tolist(), "label": y_test.tolist()})
+    if max_bert_eval is not None and len(eval_frame) > max_bert_eval:
+        eval_frame = _stratified_subsample(eval_frame, max_bert_eval, random_state)
+
+    print(f"Encoding {len(eval_frame):,} held-out texts for evaluation...", flush=True)
+    x_eval_emb = mean_pool_embeddings(
+        eval_frame["content"].tolist(),
+        batch_size=bert_batch_size,
+        model_name=bert_model_name,
+    )
+    y_eval = eval_frame["label"].astype(int).to_numpy()
+
+    predictions = model.predict(x_eval_emb)
+    print(f"\nAccuracy (BERT-embedding ensemble, eval subset): {accuracy_score(y_eval, predictions):.4f}")
     print("\nClassification report:")
-    print(classification_report(y_test, predictions, target_names=["Fake", "Real"]))
+    print(classification_report(y_eval, predictions, target_names=["Fake", "Real"]))
     print("Confusion matrix:")
-    print(confusion_matrix(y_test, predictions))
+    print(confusion_matrix(y_eval, predictions))
 
     joblib.dump(model, MODEL_PATH, compress=3)
     joblib.dump(tfidf, TFIDF_PATH, compress=3)
-    print(f"\nSaved model to {MODEL_PATH}")
-    print(f"Saved vectorizer to {TFIDF_PATH}")
+    print(f"\nSaved classifier to {MODEL_PATH}")
+    print(f"Saved TF-IDF (evidence similarity) to {TFIDF_PATH}")
     return model, tfidf
 
 
@@ -144,9 +265,32 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train the FactLens fake news detector.")
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--random-state", type=int, default=42)
+    parser.add_argument(
+        "--max-bert-train",
+        type=int,
+        default=12000,
+        help="Max training rows used for BERT embeddings (stratified sample).",
+    )
+    parser.add_argument(
+        "--max-bert-eval",
+        type=int,
+        default=8000,
+        help="Max held-out rows for evaluation metrics; use 0 for full test split (slow).",
+    )
+    parser.add_argument("--bert-batch-size", type=int, default=16)
+    parser.add_argument("--bert-model-name", default=BERT_MODEL_NAME)
     args = parser.parse_args()
-    train_model(test_size=args.test_size, random_state=args.random_state)
+    max_eval = None if args.max_bert_eval == 0 else args.max_bert_eval
+    train_model(
+        test_size=args.test_size,
+        random_state=args.random_state,
+        max_bert_train=args.max_bert_train,
+        max_bert_eval=max_eval,
+        bert_batch_size=args.bert_batch_size,
+        bert_model_name=args.bert_model_name,
+    )
 
 
 if __name__ == "__main__":
     main()
+

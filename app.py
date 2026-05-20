@@ -17,11 +17,10 @@ import requests
 from flask import Flask, jsonify, render_template, request
 from sklearn.metrics.pairwise import cosine_similarity
 
-from model import MODEL_PATH, TFIDF_PATH, clean_text
+from model import BERT_DISPLAY_NAME, MODEL_PATH, TFIDF_PATH, clean_text, mean_pool_embeddings
 
 
 BASE_DIR = Path(__file__).resolve().parent
-BERT_OUTPUT_DIR = BASE_DIR / "models" / "train_bert"
 
 
 def load_local_env() -> None:
@@ -88,34 +87,75 @@ HIGH_EVIDENCE_SIMILARITY_THRESHOLD = 0.99
 TRUSTED_SOURCES = {
     "ABC News",
     "ABC News (AU)",
+    "AFP",
     "Al Jazeera English",
+    "ANI News",
+    "AP News",
     "Associated Press",
     "BBC News",
+    "BBC.com",
     "Bloomberg",
+    "Business Standard",
     "CBS News",
+    "CNBC",
     "CNN",
+    "Deccan Herald",
+    "Deutsche Welle",
+    "DW News",
+    "Forbes",
     "Financial Times",
     "Fox News",
+    "France 24",
+    "Hindustan Times",
+    "India Today",
+    "Indian Express",
+    "Livemint",
+    "Mint",
     "National Institutes of Health",
+    "NBC News",
+    "NDTV",
+    "NDTV News",
+    "New York Times",
     "NPR",
+    "PBS NewsHour",
+    "Politico",
+    "Press Trust of India",
+    "ProPublica",
     "Reuters",
+    "Scroll.in",
     "Science Daily",
+    "Scientific American",
+    "The Economic Times",
     "The Associated Press",
     "The Guardian",
     "The Hindu",
     "The Indian Express",
     "The Irish Times",
+    "The New York Times",
+    "The News Minute",
+    "The Print",
     "The Times of India",
+    "The Tribune India",
+    "The Wire",
+    "The Wire India",
     "The Wall Street Journal",
     "The Washington Post",
+    "Times of India",
+    "Wire.in",
 }
+TRUSTED_SOURCE_NAMES = {source.casefold() for source in TRUSTED_SOURCES}
+CLASS_NAMES = {0: "Fake", 1: "Real"}
 
 _model = None
 _tfidf = None
-_bert_model = None
-_bert_tokenizer = None
-_bert_device = None
 _news_cache: dict[str, dict[str, Any]] = {}
+
+
+def is_trusted_source(source: str | None) -> bool:
+    if not source:
+        return False
+    normalized = re.sub(r"\s+", " ", source).strip().casefold()
+    return normalized in TRUSTED_SOURCE_NAMES
 
 
 def load_artifacts() -> None:
@@ -126,60 +166,76 @@ def load_artifacts() -> None:
     _tfidf = joblib.load(TFIDF_PATH)
 
 
-def load_bert_artifacts() -> bool:
-    global _bert_model, _bert_tokenizer, _bert_device
-    if _bert_model is not None and _bert_tokenizer is not None:
-        return True
-    if not BERT_OUTPUT_DIR.exists():
-        return False
-    try:
-        import torch
-        from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
-        _bert_tokenizer = AutoTokenizer.from_pretrained(BERT_OUTPUT_DIR, use_fast=False)
-        _bert_model = AutoModelForSequenceClassification.from_pretrained(BERT_OUTPUT_DIR)
-        _bert_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        _bert_model.to(_bert_device)
-        _bert_model.eval()
-        return True
-    except Exception as exc:
-        app.logger.warning(f"BERT artifacts could not be loaded: {exc}")
-        _bert_model = None
-        _bert_tokenizer = None
-        _bert_device = None
-        return False
+def _probability_payload(estimator: Any, features: Any) -> dict[str, Any]:
+    probabilities = estimator.predict_proba(features)[0]
+    classes = list(estimator.classes_)
+    fake_probability = float(probabilities[classes.index(0)]) if 0 in classes else 0.0
+    real_probability = float(probabilities[classes.index(1)]) if 1 in classes else 0.0
+    predicted_label = 1 if real_probability >= fake_probability else 0
+    confidence = max(fake_probability, real_probability)
+    return {
+        "prediction": CLASS_NAMES[predicted_label],
+        "label": predicted_label,
+        "confidence": round(confidence * 100, 2),
+        "probabilities": {
+            "fake": round(fake_probability * 100, 2),
+            "real": round(real_probability * 100, 2),
+        },
+    }
 
 
-def predict_with_bert(cleaned_text: str) -> dict[str, Any] | None:
-    if not load_bert_artifacts():
-        return None
-    try:
-        import torch
+MODEL_DISPLAY_NAMES = {
+    "logistic": "Logistic Model",
+    "passive_aggressive": "Passive Model",
+}
 
-        encoded = _bert_tokenizer(
-            cleaned_text,
-            truncation=True,
-            padding=True,
-            max_length=160,
-            return_tensors="pt",
+
+def classifier_breakdown(features: Any, bert_result: dict[str, Any]) -> list[dict[str, Any]]:
+    breakdown = []
+    for model_key, estimator in getattr(_model, "named_estimators_", {}).items():
+        model_result = _probability_payload(estimator, features)
+        breakdown.append(
+            {
+                "id": model_key,
+                "name": MODEL_DISPLAY_NAMES.get(model_key, model_key.replace("_", " ").title()),
+                **model_result,
+            }
         )
-        encoded = {key: value.to(_bert_device) for key, value in encoded.items()}
-        with torch.no_grad():
-            probabilities = torch.softmax(_bert_model(**encoded).logits, dim=1).squeeze(0).cpu().numpy()
-        probability_index = int(probabilities.argmax())
-        confidence_percent = round(float(probabilities[probability_index]) * 100, 2)
-        return {
-            "prediction": "Real" if probability_index == 1 else "Fake",
-            "confidence": confidence_percent,
-            "label": probability_index,
-            "probabilities": {
-                "fake": round(float(probabilities[0]) * 100, 2),
-                "real": round(float(probabilities[1]) * 100, 2),
-            },
+
+    breakdown.append(
+        {
+            "id": "bert_model",
+            "name": "BERT Model",
+            "prediction": bert_result["prediction"],
+            "confidence": bert_result["confidence"],
+            "probabilities": bert_result["probabilities"],
         }
-    except Exception as exc:
-        app.logger.warning(f"BERT prediction failed: {exc}")
-        return None
+    )
+    return breakdown
+
+
+def build_voting_summary(breakdown: list[dict[str, Any]]) -> dict[str, Any]:
+    fake_votes = sum(1 for row in breakdown if row["prediction"] == "Fake")
+    real_votes = sum(1 for row in breakdown if row["prediction"] == "Real")
+    fake_probability = sum(float(row["probabilities"]["fake"]) for row in breakdown) / len(breakdown)
+    real_probability = sum(float(row["probabilities"]["real"]) for row in breakdown) / len(breakdown)
+    average_confidence = sum(float(row["confidence"]) for row in breakdown) / len(breakdown)
+    prediction = "Real" if real_votes >= fake_votes else "Fake"
+    return {
+        "prediction": prediction,
+        "label": 1 if prediction == "Real" else 0,
+        "averageConfidence": round(average_confidence, 2),
+        "votes": {"fake": fake_votes, "real": real_votes},
+        "probabilities": {
+            "fake": round(fake_probability, 2),
+            "real": round(real_probability, 2),
+        },
+        "explanation": (
+            f"Voting: {real_votes} Real vote{'s' if real_votes != 1 else ''}, "
+            f"{fake_votes} Fake vote{'s' if fake_votes != 1 else ''}. "
+            f"Model voting result is {prediction} with {round(average_confidence, 2)}% average confidence."
+        ),
+    }
 
 
 @lru_cache(maxsize=512)
@@ -189,31 +245,39 @@ def predict_article(raw_text: str) -> dict[str, Any]:
 
     cleaned = clean_text(raw_text)
     word_count = len(cleaned.split())
-    features = _tfidf.transform([cleaned])
+    text_for_encoder = cleaned if cleaned.strip() else " "
+    features = mean_pool_embeddings([text_for_encoder], batch_size=1)
     probabilities = _model.predict_proba(features)[0]
     probability_index = int(probabilities.argmax())
     predicted_label = int(_model.classes_[probability_index])
     confidence = float(probabilities[probability_index])
     confidence_percent = round(confidence * 100, 2)
     model_prediction = "Real" if predicted_label == 1 else "Fake"
-    bert_result = predict_with_bert(cleaned)
-
-    if bert_result is not None:
-        classical_real_probability = float(probabilities[list(_model.classes_).index(1)])
-        bert_real_probability = float(bert_result["probabilities"]["real"]) / 100
-        blended_real_probability = (classical_real_probability * 0.65) + (bert_real_probability * 0.35)
-        predicted_label = 1 if blended_real_probability >= 0.5 else 0
-        confidence = blended_real_probability if predicted_label == 1 else 1 - blended_real_probability
-        confidence_percent = round(confidence * 100, 2)
-        model_prediction = "Real" if predicted_label == 1 else "Fake"
+    bert_result = {
+        "prediction": model_prediction,
+        "label": predicted_label,
+        "confidence": confidence_percent,
+        "probabilities": _probability_payload(_model, features)["probabilities"],
+    }
+    model_breakdown = classifier_breakdown(features, bert_result)
+    voting_summary = build_voting_summary(model_breakdown)
+    bert_meta: dict[str, Any] = {
+        "model": "BERT Model",
+        "prediction": model_prediction,
+        "confidence": confidence_percent,
+        "probabilities": bert_result["probabilities"],
+    }
 
     return {
-        "prediction": model_prediction,
-        "modelConfidence": confidence_percent,
-        "confidence": confidence_percent,
-        "label": predicted_label,
-        "modelPrediction": model_prediction,
-        "bertPrediction": bert_result,
+        "prediction": voting_summary["prediction"],
+        "modelConfidence": voting_summary["averageConfidence"],
+        "confidence": voting_summary["averageConfidence"],
+        "label": voting_summary["label"],
+        "modelPrediction": voting_summary["prediction"],
+        "probabilities": voting_summary["probabilities"],
+        "votingSummary": voting_summary,
+        "modelBreakdown": model_breakdown,
+        "bertPrediction": bert_meta,
         "wordCount": word_count,
     }
 
@@ -329,7 +393,7 @@ def build_verdict(raw_text: str, source: str = "", url: str = "") -> dict[str, A
         app.logger.debug(f"Candidate articles: {len(candidate_articles)}, error: {evidence_error}")
         supporting_articles = score_supporting_articles(raw_text, candidate_articles, exclude_url=url)
 
-    trusted_support_count = sum(1 for article in supporting_articles if article.get("source") in TRUSTED_SOURCES)
+    trusted_support_count = sum(1 for article in supporting_articles if is_trusted_source(article.get("source")))
     support_count = len(supporting_articles)
     best_similarity = max((float(article.get("similarity", 0)) for article in supporting_articles), default=0.0)
     exact_match = best_similarity >= 100.0
@@ -338,10 +402,21 @@ def build_verdict(raw_text: str, source: str = "", url: str = "") -> dict[str, A
     confidence = float(model_result["modelConfidence"])
     word_count = int(model_result["wordCount"])
 
+    has_trusted_source = is_trusted_source(source)
+    has_strong_support = support_count >= EVIDENCE_SUPPORT_THRESHOLD or best_similarity >= EVIDENCE_SIMILARITY_THRESHOLD * 100
+
     if exact_match:
         final_prediction = "Real"
         verdict = "Exact Match Found"
         reason = "Identical article found in news sources."
+    elif has_trusted_source and prediction == "Fake" and confidence < FAKE_CONFIDENCE_THRESHOLD:
+        final_prediction = "Needs Review"
+        verdict = "Trusted Source Disagrees"
+        reason = "The model leans fake, but the article source is trusted and confidence is not high enough for a hard fake verdict."
+    elif prediction == "Fake" and has_strong_support:
+        final_prediction = "Needs Review"
+        verdict = "Evidence Disagrees"
+        reason = "The model leans fake, but similar recent coverage was found. Review the source articles before deciding."
     elif prediction == "Real" and confidence >= 95.0:
         final_prediction = "Real"
         verdict = "High Confidence Real"
@@ -360,6 +435,17 @@ def build_verdict(raw_text: str, source: str = "", url: str = "") -> dict[str, A
         "prediction": final_prediction,
         "verdict": verdict,
         "reason": reason,
+        "evidenceApiResponse": {
+            "exactArticleFound": exact_match,
+            "status": "Exact news article found" if exact_match else "Exact news article not found",
+            "lookup": "NewsAPI + Google News RSS",
+            "query": evidence_query,
+            "supportCount": support_count,
+            "trustedSupportCount": trusted_support_count,
+            "bestSimilarity": round(best_similarity, 2),
+            "matchedArticle": supporting_articles[0] if exact_match and supporting_articles else None,
+            "error": evidence_error,
+        },
         "topic": topic_query,
         "evidenceQuery": evidence_query,
         "supportCount": support_count,
